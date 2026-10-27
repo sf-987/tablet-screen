@@ -1,0 +1,9 @@
+# ~/.config/tablet-screen.conf — all optional; environment variables override.
+#TABLET_OUTPUTS="HDMI-0 DP-1"   # heads in tablet order (default: auto-detect 0mm x 0mm outputs)
+#TABLET_MODE=3840x2160          # mode set when the script first enables a head
+#TABLET_VNC_SCALE=1/2           # x11vnc output scale; 1 = none
+#TABLET_TOUCH=0                 # 1 = allow mouse/keyboard from the tablets
+#TABLET_CURSOR=paint            # paint | shape
+#TABLET_ALLOW=192.168.1.        # extra allowed client prefixes (comma-separated)
+#TABLET_BASE_PORT=5900
+#TABLET_WAIT=5

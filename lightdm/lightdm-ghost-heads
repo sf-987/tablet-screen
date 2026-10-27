@@ -1,0 +1,21 @@
+#!/bin/sh
+# /usr/local/sbin/lightdm-ghost-heads
+# Run by LightDM before the greeter appears (display-setup-script, see
+# 50-ghost-heads.conf). Turns off the dummy-plug heads so the login screen lands on
+# a real monitor, and makes the laptop panel primary when it is the only real display.
+# The desktop's own saved layout takes over after login; this only affects the greeter.
+#
+# Edit for your machine:
+GHOSTS="HDMI-0 DP-1"          # heads with dummy plugs (xrandr names)
+PANEL="DP-3"                  # laptop panel
+EXTERNAL_RE='^DP-0\.[0-9]+ connected'   # regex matching your real external monitors
+
+for o in $GHOSTS; do
+    xrandr --output "$o" --off 2>/dev/null
+done
+
+# If no real external monitor is present, put the greeter on the panel.
+if ! xrandr --current | grep -E "$EXTERNAL_RE" >/dev/null 2>&1; then
+    xrandr --output "$PANEL" --auto --primary 2>/dev/null
+fi
+exit 0
