@@ -17,28 +17,32 @@
 # of the same names override it.
 set -euo pipefail
 
-# ---- settings (defaults; override in ~/.config/tablet-screen.conf) ---------------
-# Heads to use, in tablet order. Empty = auto-detect: connected outputs that report a
-# physical size of 0mm x 0mm, which is what HDMI dummy plugs (and most virtual
-# outputs) do. Set explicitly if auto-detection picks the wrong thing.
-TABLET_OUTPUTS="${TABLET_OUTPUTS:-}"
+# ---- settings ---------------------------------------------------------------------
+# Precedence: environment > ~/.config/tablet-screen.conf > the defaults below.
+_SETTINGS=(TABLET_OUTPUTS TABLET_MODE TABLET_VNC_SCALE TABLET_TOUCH TABLET_CURSOR TABLET_ALLOW
+           TABLET_BASE_PORT TABLET_WAIT TABLET_NAMES TABLET_XDAMAGE)
+for _v in "${_SETTINGS[@]}"; do [[ -n ${!_v+x} ]] && declare "_ENV_$_v=${!_v}"; done   # snapshot env
+
+# Heads to use, in tablet order. Set this explicitly (xrandr names). Empty = auto-detect
+# connected outputs reporting "0mm x 0mm", which some dummy plugs do and others don't.
+TABLET_OUTPUTS=""
 # Mode set on a head when this script enables it (the desktop's saved layout wins
-# afterwards). 3840x2160 + VNC scale 1/2 suits a desktop running at 200% UI scale;
+# afterwards). 3840x2400/2160 + VNC scale 1/2 suits a desktop at 200% UI scale;
 # 1440x900 + scale 1 suits 100%. See README "Scaling".
-TABLET_MODE="${TABLET_MODE:-3840x2160}"
-TABLET_VNC_SCALE="${TABLET_VNC_SCALE:-1/2}"     # x11vnc -scale; 1 = none; append :nb for no blending
-TABLET_TOUCH="${TABLET_TOUCH:-0}"               # 1 = tablets may send mouse/keyboard
-TABLET_CURSOR="${TABLET_CURSOR:-paint}"         # paint | shape (see README)
-TABLET_ALLOW="${TABLET_ALLOW:-}"                # extra allowed client prefixes, e.g. 192.168.1.
-TABLET_BASE_PORT="${TABLET_BASE_PORT:-5900}"    # tablet N listens on BASE_PORT+N
-TABLET_WAIT="${TABLET_WAIT:-20}"                 # x11vnc poll interval ms (raise if CPU-bound)
-TABLET_NAMES="${TABLET_NAMES:-}"                # "usbserial=Name ..." to label tether links
-TABLET_XDAMAGE="${TABLET_XDAMAGE:-0}"           # 1 = let x11vnc use XDamage hints (near-zero idle CPU;
-                                                #     under some compositors updates lag), 0 = poll everything
+TABLET_MODE=3840x2400
+TABLET_VNC_SCALE=1/2        # x11vnc -scale; 1 = none; append :nb for no blending (faster, ragged cursor)
+TABLET_TOUCH=0              # 1 = tablets may send mouse/keyboard
+TABLET_CURSOR=paint         # paint | shape (see README)
+TABLET_ALLOW=               # extra allowed client prefixes, e.g. 192.168.1.
+TABLET_BASE_PORT=5900       # tablet N listens on BASE_PORT+N
+TABLET_WAIT=20              # x11vnc poll interval ms (5 = snappier, more CPU)
+TABLET_NAMES=               # "usbserial=Name ..." to label tether links
+TABLET_XDAMAGE=0            # 1 = poll only damaged regions (near-zero idle CPU; may lag under some compositors)
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/tablet-screen.conf"
 # shellcheck disable=SC1090
 [[ -r $CONF ]] && source "$CONF"
+for _v in "${_SETTINGS[@]}"; do _e="_ENV_$_v"; [[ -n ${!_e+x} ]] && declare "$_v=${!_e}"; done  # env wins
 # ---------------------------------------------------------------------------------
 
 VNC_OPTS=(-forever -shared -nopw -cursor most -wait "$TABLET_WAIT" -defer "$TABLET_WAIT"
