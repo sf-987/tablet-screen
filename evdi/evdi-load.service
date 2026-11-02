@@ -1,0 +1,16 @@
+# /etc/systemd/system/evdi-load.service
+# Load the evdi module late: after the real GPU driver, before the display manager.
+# Do NOT use /etc/modules-load.d for evdi: dracut copies that into the initramfs, evdi
+# then becomes the first DRM device at boot, and the console / LUKS prompt is drawn on a
+# display that does not exist (black screen before login).
+[Unit]
+Description=Load evdi virtual display module before the display manager
+Before=display-manager.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe evdi
+
+[Install]
+WantedBy=display-manager.service

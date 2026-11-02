@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""tablet-cursor-watch — show each x11vnc server's cursor only while the pointer is in
+its clip region. Started by tablet-screen; not meant to be run by hand.
+
+usage: tablet-cursor-watch PREFIX PORT:WxH+X+Y [PORT:WxH+X+Y ...]
+
+Keeps one VNC control connection open per server (x11vnc -remote_prefix PREFIX turns
+ClientCutText "PREFIXcmd=..." into remote-control commands) so a show/hide takes a few
+milliseconds instead of a fresh handshake per event. Reconnects if a server restarts.
+Pointer position comes from `xdotool getmouselocation` ten times a second.
+"""
+import socket, struct, subprocess, sys, time
+
+POLL = 0.1
+
+
+class Ctl:
+    """Persistent control connection to one x11vnc server."""
+
+    def __init__(self, port, prefix):
+        self.port, self.prefix, self.sock = port, prefix, None
+
+    def _rd(self, n):
+        b = b""
+        while len(b) < n:
+            d = self.sock.recv(n - len(b))
+            if not d:
+                raise EOFError
+            b += d
+        return b
+
+    def connect(self):
+        self.close()
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        self.sock = s
+        self._rd(12); s.sendall(b"RFB 003.008\n")
+        types = self._rd(self._rd(1)[0])
+        if 1 not in types:
+            raise RuntimeError("server requires auth; control needs -nopw")
+        s.sendall(b"\x01")
+        if struct.unpack(">I", self._rd(4))[0] != 0:
+            raise RuntimeError("security failed")
+        s.sendall(b"\x01")                                    # ClientInit, shared
+        hdr = self._rd(24); self._rd(struct.unpack(">I", hdr[20:24])[0])  # ServerInit
+        s.settimeout(0.05)
+
+    def close(self):
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+        self.sock = None
+
+    def send(self, cmd):
+        """Send one remote-control command; reconnect once on failure."""
+        for attempt in (1, 2):
+            try:
+                if self.sock is None:
+                    self.connect()
+                t = f"{self.prefix}cmd={cmd}".encode()
+                self.sock.sendall(b"\x06\x00\x00\x00" + struct.pack(">I", len(t)) + t)
+                return True
+            except Exception:
+                self.close()
+                time.sleep(0.2)
+        return False
+
+    def drain(self):
+        """Discard server messages (cut-text acks, bells) so the buffer never fills."""
+        if self.sock is None:
+            return
+        try:
+            while True:
+                if not self.sock.recv(4096):      # b"" = server closed the connection
+                    self.close(); return
+        except socket.timeout:
+            pass
+        except Exception:
+            self.close()
+
+
+def pointer():
+    out = subprocess.run(["xdotool", "getmouselocation", "--shell"],
+                         capture_output=True, text=True, timeout=2).stdout
+    d = dict(l.split("=", 1) for l in out.split() if "=" in l)
+    return int(d["X"]), int(d["Y"])
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
+    prefix = sys.argv[1]
+    heads = []
+    for a in sys.argv[2:]:
+        port, g = a.split(":", 1)
+        wh, x, y = g.split("+")
+        w, h = wh.split("x")
+        heads.append({"ctl": Ctl(int(port), prefix), "x": int(x), "y": int(y),
+                      "w": int(w), "h": int(h), "inside": None})
+    time.sleep(1)                      # let the servers finish starting
+    while True:
+        try:
+            px, py = pointer()
+        except Exception:
+            time.sleep(POLL); continue
+        for hd in heads:
+            now = hd["x"] <= px < hd["x"] + hd["w"] and hd["y"] <= py < hd["y"] + hd["h"]
+            hd["ctl"].drain()                  # notice a dead server before sending
+            if now != hd["inside"]:
+                hd["inside"] = now
+                if now:
+                    hd["ctl"].send("show_cursor")
+                else:
+                    hd["ctl"].send("noshow_cursor")
+                    hd["ctl"].send("refresh")      # repaint where the cursor was last drawn
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,77 @@
+#!/bin/bash
+# /usr/local/sbin/evdi-virtual-heads  — run as root (sudo)
+#
+#   evdi-virtual-heads up      load evdi, force each virtual connector "connected" with
+#                              the tablet EDID, hand the evdi provider to the NVIDIA screen
+#   evdi-virtual-heads down    unforce the connectors (outputs become disconnected)
+#   evdi-virtual-heads status
+#
+# Needs: evdi module (DKMS), /usr/lib/firmware/edid/tablet.edid, debugfs mounted (default).
+# The evdi card(s) are created by the module parameter initial_device_count (see
+# /etc/modprobe.d/evdi.conf). Each card has one connector, named DVI-I-1 in the kernel;
+# X names them DVI-I-<n>-1 (n = GPU index).
+set -euo pipefail
+EDID=/usr/lib/firmware/edid/tablet.edid
+XUSER="${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}"
+XDISPLAY="${DISPLAY:-:0}"
+XAUTH="${XAUTHORITY:-$(getent passwd "$XUSER" | cut -d: -f6)/.Xauthority}"
+
+die() { echo "evdi-virtual-heads: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "run with sudo"
+
+# debugfs connector dirs belonging to evdi cards
+evdi_connectors() {
+  local c d
+  for d in /sys/class/drm/card*; do
+    [[ -e $d/device/driver ]] || continue
+    [[ $(basename "$(readlink "$d/device/driver")") == evdi ]] || continue
+    c=$(basename "$d"); c=${c#card}
+    ls -d /sys/kernel/debug/dri/"$c"/DVI-* 2>/dev/null || true
+  done
+}
+
+as_user_xrandr() { sudo -u "$XUSER" env DISPLAY="$XDISPLAY" XAUTHORITY="$XAUTH" xrandr "$@"; }
+
+cmd_up() {
+  [[ -r $EDID ]] || die "$EDID missing"
+  modprobe evdi || die "evdi module failed to load (dkms status?)"
+  sleep 1
+  local n=0 d
+  for d in $(evdi_connectors); do
+    cat "$EDID" > "$d/edid_override"
+    echo on > "$d/force"
+    n=$((n+1))
+    echo "forced $(basename "$(dirname "$d")")/$(basename "$d") connected"
+  done
+  (( n )) || die "no evdi connectors found under /sys/kernel/debug/dri (module loaded? initial_device_count set?)"
+  # make the NVIDIA screen the render source for the evdi (modesetting) outputs
+  if as_user_xrandr --listproviders | grep -q modesetting; then
+    as_user_xrandr --setprovideroutputsource modesetting NVIDIA-0 || echo "note: setprovideroutputsource failed (check Xorg.0.log)"
+  else
+    echo "note: no 'modesetting' provider in xrandr --listproviders; X did not pick up the evdi card (see OutputClass snippet)"
+  fi
+  as_user_xrandr | grep -E '^DVI-I' || echo "note: no DVI-I outputs visible in xrandr yet"
+}
+
+cmd_down() {
+  local d
+  for d in $(evdi_connectors); do
+    echo off > "$d/force"
+    : > "$d/edid_override" 2>/dev/null || true
+  done
+  echo "evdi connectors unforced"
+}
+
+cmd_status() {
+  local d
+  for d in $(evdi_connectors); do
+    printf '%s: force=%s\n' "$d" "$(cat "$d/force")"
+  done
+  as_user_xrandr --listproviders
+  as_user_xrandr | grep -E '^DVI-I' || true
+}
+
+case "${1:-}" in
+  up) cmd_up ;; down) cmd_down ;; status) cmd_status ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac

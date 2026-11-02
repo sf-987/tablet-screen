@@ -26,12 +26,15 @@ TABLET_OUTPUTS="${TABLET_OUTPUTS:-}"
 # afterwards). 3840x2160 + VNC scale 1/2 suits a desktop running at 200% UI scale;
 # 1440x900 + scale 1 suits 100%. See README "Scaling".
 TABLET_MODE="${TABLET_MODE:-3840x2160}"
-TABLET_VNC_SCALE="${TABLET_VNC_SCALE:-1/2}"     # x11vnc -scale fraction; 1 = none
+TABLET_VNC_SCALE="${TABLET_VNC_SCALE:-1/2}"     # x11vnc -scale; 1 = none; append :nb for no blending
 TABLET_TOUCH="${TABLET_TOUCH:-0}"               # 1 = tablets may send mouse/keyboard
 TABLET_CURSOR="${TABLET_CURSOR:-paint}"         # paint | shape (see README)
 TABLET_ALLOW="${TABLET_ALLOW:-}"                # extra allowed client prefixes, e.g. 192.168.1.
 TABLET_BASE_PORT="${TABLET_BASE_PORT:-5900}"    # tablet N listens on BASE_PORT+N
-TABLET_WAIT="${TABLET_WAIT:-5}"                 # x11vnc poll interval ms (raise if CPU-bound)
+TABLET_WAIT="${TABLET_WAIT:-20}"                 # x11vnc poll interval ms (raise if CPU-bound)
+TABLET_NAMES="${TABLET_NAMES:-}"                # "usbserial=Name ..." to label tether links
+TABLET_XDAMAGE="${TABLET_XDAMAGE:-0}"           # 1 = let x11vnc use XDamage hints (near-zero idle CPU;
+                                                #     under some compositors updates lag), 0 = poll everything
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/tablet-screen.conf"
 # shellcheck disable=SC1090
@@ -39,14 +42,15 @@ CONF="${XDG_CONFIG_HOME:-$HOME/.config}/tablet-screen.conf"
 # ---------------------------------------------------------------------------------
 
 VNC_OPTS=(-forever -shared -nopw -cursor most -wait "$TABLET_WAIT" -defer "$TABLET_WAIT"
-          -noxdamage -speeds lan -nowf -nowcr -noscr)
+          -speeds lan -nowf -nowcr -noscr)
+[[ $TABLET_XDAMAGE == 1 ]] || VNC_OPTS+=(-noxdamage)
 # -nowf -nowcr -noscr: window-move/scroll copy-rect optimisations; with -clip they
 #   segfaulted x11vnc 0.9.17 during a window drag, and on a USB/LAN link they add nothing.
 # No -ncache: viewers that don't understand it render the cache as a tall black strip.
 [[ $TABLET_CURSOR == paint ]] && VNC_OPTS+=(-nocursorshape)
-[[ $TABLET_VNC_SCALE != 1 ]] && VNC_OPTS+=(-scale "$TABLET_VNC_SCALE:nb")
+[[ $TABLET_VNC_SCALE != 1 ]] && VNC_OPTS+=(-scale "$TABLET_VNC_SCALE")   # e.g. 1/2 (blended) or 1/2:nb (faster, ragged cursor)
 # Tablets are monitors: clients may only send clipboard text (-input C), which doubles
-# as the per-server control channel (-remote_prefix, see vnc_ctl). TABLET_TOUCH=1
+# as the per-server control channel (-remote_prefix, see tablet-cursor-watch). TABLET_TOUCH=1
 # additionally allows keyboard/mouse from the tablet.
 if [[ $TABLET_TOUCH == 1 ]]; then VNC_OPTS+=(-input KMBC); else VNC_OPTS+=(-input C); fi
 CTL_PREFIX="TS_"
@@ -62,7 +66,7 @@ geom() { xrandr --current | awk -v o="$1" '$1==o && $2=="connected"{for(i=3;i<=N
 # the heads this script manages
 tablet_outputs() {
   if [[ -n $TABLET_OUTPUTS ]]; then
-    echo $TABLET_OUTPUTS
+    tr ' ' '\n' <<<"$TABLET_OUTPUTS" | grep -v '^$'
   else
     xrandr --current | awk '$2=="connected" && / 0mm x 0mm/ {print $1}'
   fi
@@ -80,95 +84,15 @@ rightmost_output() {
   echo "$best"
 }
 
-# Per-server control. x11vnc's -R channel is one X property that the first instance
-# to read it consumes, so it cannot address one of several servers. Instead each
-# server runs with -remote_prefix, which turns clipboard text sent by a VNC client
-# into remote-control commands. vnc_ctl is a tiny VNC client: connect to the port,
-# send the command, query show_cursor, retry until the answer matches.
-vnc_ctl() {  # port command expected-show_cursor-value(0|1|-)
-  python3 - "$1" "$2" "$3" "$CTL_PREFIX" <<'PY'
-import socket, struct, sys, time
-port, cmd, want, pfx = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-
-def session(texts, wait):
-    s = socket.create_connection(("127.0.0.1", port), timeout=3)
-    def rd(n):
-        b = b""
-        while len(b) < n:
-            d = s.recv(n - len(b))
-            if not d: raise EOFError
-            b += d
-        return b
-    rd(12); s.sendall(b"RFB 003.008\n")
-    types = rd(rd(1)[0])
-    if 1 not in types: raise RuntimeError("server wants auth; control needs -nopw")
-    s.sendall(b"\x01")
-    if struct.unpack(">I", rd(4))[0] != 0: raise RuntimeError("security failed")
-    s.sendall(b"\x01")                                   # ClientInit, shared
-    hdr = rd(24); rd(struct.unpack(">I", hdr[20:24])[0])  # ServerInit
-    for t in texts:
-        b = t.encode(); s.sendall(b"\x06\x00\x00\x00" + struct.pack(">I", len(b)) + b)
-    out, buf, end = [], b"", time.time() + wait
-    s.settimeout(0.3)
-    while time.time() < end:
-        try:
-            d = s.recv(4096)
-        except socket.timeout:
-            continue
-        if not d: break
-        buf += d
-        while buf:
-            if buf[0] == 3 and len(buf) >= 8:              # ServerCutText
-                ln = struct.unpack(">I", buf[4:8])[0]
-                if len(buf) < 8 + ln: break
-                out.append(buf[8:8+ln].decode(errors="replace")); buf = buf[8+ln:]
-            elif buf[0] == 2: buf = buf[1:]                # Bell
-            else: buf = b""; break
-        if any("ans=" in o for o in out): break            # query answered: done
-    s.close(); return out
-
-ok = False
-for attempt in range(6):
-    try:
-        ans = session([f"{pfx}cmd={cmd}", f"{pfx}show_cursor"], 1.5)
-    except Exception:
-        time.sleep(0.2); continue
-    if want == "-" or any(a.strip().endswith(f"ans=show_cursor:{want}") for a in ans):
-        ok = True; break
-    time.sleep(0.2)
-sys.exit(0 if ok else 1)
-PY
-}
-
-# Watch the pointer; show each head's cursor only while the pointer is in that
-# region. (x11vnc clamps the cursor to the clip region while the pointer is
-# elsewhere, which otherwise shows a stray cursor at the tablet's edge.)
-cursor_watch() {  # port:clip ...   (clip = WxH+X+Y)
-  local -a P CW CH CX CY IN; local a g i n=0 now X Y
-  for a in "$@"; do
-    P[n]=${a%%:*}; g=${a#*:}
-    CW[n]=${g%%x*}; CH[n]=${g#*x}; CH[n]=${CH[n]%%+*}
-    CX[n]=${g#*+}; CY[n]=${CX[n]#*+}; CX[n]=${CX[n]%%+*}; IN[n]=-1; n=$((n+1))
-  done
-  sleep 1   # let the x11vnc instances finish starting before the first command
-  while sleep 0.1; do
-    eval "$(xdotool getmouselocation --shell 2>/dev/null)" || continue   # sets X and Y
-    for ((i=0;i<n;i++)); do
-      now=0
-      if (( X >= CX[i] && X < CX[i] + CW[i] && Y >= CY[i] && Y < CY[i] + CH[i] )); then now=1; fi
-      if (( now != IN[i] )); then
-        IN[i]=$now
-        if (( now )); then vnc_ctl "${P[i]}" show_cursor 1 || true
-        else               vnc_ctl "${P[i]}" noshow_cursor 0 || true
-                           vnc_ctl "${P[i]}" refresh - || true; fi   # repaint where it was last drawn
-      fi
-    done
-  done
-}
+# Cursor show/hide per head is done by tablet-cursor-watch (same directory as this
+# script or on PATH): it keeps a control connection to each server open via
+# -remote_prefix and tells it show_cursor / noshow_cursor as the pointer crosses.
+WATCHER="$(dirname "$(readlink -f "$0")")/tablet-cursor-watch"
+command -v "$WATCHER" >/dev/null || WATCHER=tablet-cursor-watch
 
 # IPv4 addresses on USB-tethering interfaces (enp*u*, usb*, enx*)
 tether_addrs() {
-  ip -br -4 addr | awk '$1 ~ /^(enp[0-9a-z]*u[0-9]|usb|enx)/ {sub("/.*","",$3); print $3}'
+  ip -br -4 addr 2>/dev/null | awk '$1 ~ /^(enp[0-9a-z]*u[0-9]|usb|enx)/ {sub("/.*","",$3); print $3}'
 }
 
 # Accept VNC connections only from localhost (cursor control) and the USB-tether
@@ -184,11 +108,34 @@ start_vnc() {  # output index
   local clip; clip=$(geom "$1"); [[ -n $clip ]] || die "$1 did not come up (out of CRTCs?)"
   local port=$((TABLET_BASE_PORT + $2))
   x11vnc -clip "$clip" -rfbport "$port" -remote_prefix "$CTL_PREFIX" -allow "$(allow_list)" \
-         "${VNC_OPTS[@]}" -bg -o "$RUNDIR/$1.log" >/dev/null
+         "${VNC_OPTS[@]}" -bg -o "$RUNDIR/$1.log" >/dev/null \
+    || die "x11vnc for $1 failed to start on port $port (see $RUNDIR/$1.log)"
   CLIPS+=("$port:$clip")
   echo "  tablet $2 -> port $port  ($clip)  connect the viewer to:"
-  for a in $(tether_addrs); do echo "      $a:$port  (USB tether)"; done
+  ip -br -4 addr 2>/dev/null | awk '$1 ~ /^(enp[0-9a-z]*u[0-9]|usb|enx)/ {sub("/.*","",$3); print $3, $1}' \
+    | while read -r a ifn; do
+        # USB model string is often generic (SAMSUNG_Android); the serial is per device.
+        # Map serials to names in the config: TABLET_NAMES="R52X...=S9U R52Y...=S8U"
+        serial=$(udevadm info -q property -p "/sys/class/net/$ifn" 2>/dev/null | sed -n 's/^ID_SERIAL_SHORT=//p')
+        name=; for kv in ${TABLET_NAMES:-}; do [[ ${kv%%=*} == "$serial" ]] && name=${kv#*=}; done
+        echo "      $a:$port  (USB tether on $ifn${serial:+, serial $serial}${name:+ = $name})"
+      done || true
   [[ -n $(tether_addrs) ]] || echo "      (no USB-tether link found; only localhost allowed — set TABLET_ALLOW for LAN use)"
+}
+
+# Stop our x11vnc servers and wait until their ports are really free (x11vnc exits
+# gracefully on SIGTERM, which takes a moment; starting the replacement too early
+# fails with "could not obtain listening port").
+stop_servers() {
+  local pat="x11vnc.*-rfbport $((TABLET_BASE_PORT / 10))[0-9]" i
+  pkill -f "$pat" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "$pat" >/dev/null || return 0
+    sleep 0.3
+  done
+  pkill -9 -f "$pat" 2>/dev/null || true
+  sleep 0.3
+  return 0
 }
 
 stop_watchers() {
@@ -212,7 +159,7 @@ cmd_on() {
   (( n > 0 && n < ${#heads[@]} )) && heads=("${heads[@]:0:n}")
 
   stop_watchers
-  pkill -f "x11vnc.*-rfbport $((TABLET_BASE_PORT / 10))[0-9]" 2>/dev/null || true
+  stop_servers
 
   # Enable any head that is off. No positions: the desktop applies its saved layout
   # for this monitor set. If it has none with this head enabled, xrandr's default
@@ -242,17 +189,17 @@ cmd_on() {
   done
   (( ${#CLIPS[@]} )) || die "no tablet head is active"
 
-  if command -v xdotool >/dev/null; then
-    cursor_watch "${CLIPS[@]}" </dev/null >/dev/null 2>&1 &
+  if command -v xdotool >/dev/null && command -v "$WATCHER" >/dev/null; then
+    "$WATCHER" "$CTL_PREFIX" "${CLIPS[@]}" </dev/null >"$RUNDIR/cursor-watch.log" 2>&1 &
     echo $! > "$RUNDIR/cursor.watch"
   else
-    echo "  (install xdotool to hide the cursor while the pointer is on other screens)"
+    echo "  (install xdotool and tablet-cursor-watch to hide the cursor while the pointer is on other screens)"
   fi
 }
 
 cmd_off() {
   stop_watchers
-  pkill -f "x11vnc.*-rfbport $((TABLET_BASE_PORT / 10))[0-9]" 2>/dev/null || true
+  stop_servers
   local o
   while read -r o; do
     [[ -n $o ]] && xrandr --output "$o" --off 2>/dev/null || true

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# setup-usb-tether — create the NetworkManager profile for USB-tethered tablets.
+#
+#   setup-usb-tether [-y] [PATTERN,...]
+#
+# Creates (or updates) one connection profile, "usb-tether", that:
+#   - matches USB network interfaces by name pattern (default: derived from the USB
+#     interfaces present right now, e.g. enp0s20f0u*,enp44s0u*, plus enx*,usb*)
+#   - never takes the default route (the tablet advertises a gateway; we don't want it)
+#   - may be active on several interfaces at once (one per tablet cable)
+#   - autoconnects with priority over NetworkManager's auto-generated "Wired connection N"
+# and offers to delete the auto-generated profiles for those interfaces, which would
+# otherwise compete and lack never-default.
+#
+# It does NOT touch profiles for interfaces that currently carry the default route
+# (e.g. a dock's USB-attached Ethernet). Review the plan it prints; -y skips the prompt.
+set -euo pipefail
+
+YES=0; [[ ${1:-} == -y ]] && { YES=1; shift; }
+PATTERNS="${1:-}"
+
+command -v nmcli >/dev/null || { echo "nmcli not found (NetworkManager required)"; exit 1; }
+[[ $EUID -eq 0 ]] || exec sudo "$0" $([[ $YES == 1 ]] && echo -y) "$PATTERNS"
+
+default_dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+
+if [[ -z $PATTERNS ]]; then
+  # USB interfaces present now, excluding the one carrying the default route
+  pats=()
+  for ifn in $(ip -br link | awk '$1 ~ /^(enp[0-9a-z]*u[0-9]|enx|usb)/ {sub("@.*","",$1); print $1}'); do
+    [[ $ifn == "$default_dev" ]] && continue
+    case $ifn in
+      enp*u*) pats+=("${ifn%%u*}u*") ;;      # enp0s20f0u2u2 -> enp0s20f0u*
+      enx*)   pats+=("enx*") ;;
+      usb*)   pats+=("usb*") ;;
+    esac
+  done
+  PATTERNS=$(printf '%s\n' "${pats[@]}" enx\* usb\* | sort -u | paste -sd, -)
+fi
+
+echo "USB-tether interface patterns: $PATTERNS"
+[[ -n $default_dev ]] && echo "Default route is on $default_dev (left alone)."
+
+# profiles NetworkManager auto-generated for matching interfaces
+stale=()
+while IFS=: read -r name dev; do
+  [[ $name == "usb-tether" || -z $dev || $dev == "$default_dev" ]] && continue
+  [[ $dev =~ ^(enp[0-9a-z]*u[0-9]|enx|usb) ]] && stale+=("$name")
+done < <(nmcli -t -f NAME,DEVICE con show)
+
+echo
+echo "Plan:"
+if nmcli -t -f NAME con show | grep -qx usb-tether; then
+  echo "  update profile 'usb-tether'"
+else
+  echo "  create profile 'usb-tether'"
+fi
+(( ${#stale[@]} )) && printf '  delete auto-generated profile: %s\n' "${stale[@]}"
+echo
+if (( ! YES )); then read -r -p "Proceed? [y/N] " a; [[ $a == [yY] ]] || exit 0; fi
+
+if nmcli -t -f NAME con show | grep -qx usb-tether; then
+  nmcli con mod usb-tether match.interface-name "$PATTERNS"
+else
+  nmcli con add type ethernet con-name usb-tether match.interface-name "$PATTERNS" >/dev/null
+fi
+nmcli con mod usb-tether ipv4.never-default yes ipv6.never-default yes \
+     connection.autoconnect yes connection.autoconnect-priority 100 \
+     connection.multi-connect multiple
+for n in "${stale[@]}"; do nmcli con delete "$n" >/dev/null && echo "deleted '$n'"; done
+
+echo
+echo "Done. Re-plug the tablet cables (or: nmcli dev connect <iface>). Check:"
+echo "  nmcli -t -f NAME,DEVICE con show --active    # usb-tether once per cable"
+echo "  ip route | head -1                           # default still via $default_dev"
